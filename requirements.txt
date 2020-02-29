@@ -1,0 +1,6 @@
+numpy
+nes_py==8.1.1 
+gym-super-mario-bros==7.3
+wandb
+line_profiler
+pytorch
