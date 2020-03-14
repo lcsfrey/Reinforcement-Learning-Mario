@@ -7,17 +7,17 @@ class History(dict):
         self.num_previous_rewards = num_previous_rewards
         self.rewards_prev = np.zeros(num_previous_rewards)
         self.reward_next_idx = 0
-        self.reward_recent_avg = float('-inf')
-        self.reward_recent_min = float('inf')
-        self.reward_recent_max = float('-inf')
+        self.reward_recent_avg = 0.0
+        self.reward_recent_min = 0.0
+        self.reward_recent_max = 0.0
         try:
             self.reward_best_avg
             self.reward_best_min
             self.reward_best_max
         except:
-            self.reward_best_avg = float('-inf')
-            self.reward_best_min = float('inf')
-            self.reward_best_max = float('-inf')
+            self.reward_best_avg = 0.0
+            self.reward_best_min = 0.0
+            self.reward_best_max = 0.0
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
@@ -26,10 +26,10 @@ class History(dict):
             self[k] = v
 
     def update_reward(self, reward):
+        # TODO: Move rewards to memory
         self.last_reward = reward
         self.reward = reward
-
-        self.rewards_prev[self.reward_next_idx] = np.array(reward)
+        self.rewards_prev[self.reward_next_idx] = reward
         self.reward_next_idx = (self.reward_next_idx + 1) % self.num_previous_rewards
         self.reward_last_avg = self.reward_recent_avg
         self.reward_recent_avg = self.rewards_prev.mean()
