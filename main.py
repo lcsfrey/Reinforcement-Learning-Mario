@@ -52,7 +52,7 @@ def play_mario(*args, **kwargs):
 
         total_current_reward += reward
 
-        # update the model
+        # model ocasionally trains for a few generations
         loss = model.update(state, action, reward, next_state, done)
 
         # Add all important information about current iteration to history
