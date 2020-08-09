@@ -1,8 +1,9 @@
 import numpy as np
+from collections import defaultdict
 
-class History(dict):
-    def __init__(self, num_previous_rewards=50, *args, **kwargs):
-        super(History, self).__init__(*args, **kwargs)
+class History(defaultdict):
+    def __init__(self, logger=None, log_iters=None, num_previous_rewards=500, *args, **kwargs):
+        super(History, self).__init__(list, *args, **kwargs)
         self.__dict__ = self
         self.num_previous_rewards = num_previous_rewards
         self.rewards_prev = np.zeros(num_previous_rewards)
@@ -10,6 +11,9 @@ class History(dict):
         self.reward_recent_avg = 0.0
         self.reward_recent_min = 0.0
         self.reward_recent_max = 0.0
+        self.logger = logger
+        self.log_iters = log_iters
+        self.logged_steps = []
         try:
             self.reward_best_avg
             self.reward_best_min
@@ -19,16 +23,23 @@ class History(dict):
             self.reward_best_min = 0.0
             self.reward_best_max = 0.0
 
-    def update(self, **kwargs):
+    def update(self, step_num=0, force_log=False, **kwargs):
         for k, v in kwargs.items():
             if k == 'reward':
                 self.update_reward(v)
-            self[k] = v
+
+            self[k].append(v)
+
+        if force_log or (self.log_iters is not None 
+                         and (step_num % self.log_iters) == 0):
+            self.logger.log_metrics(
+                step=step_num, 
+                prev_actions=self["action"][-self.num_previous_rewards:], 
+                **kwargs
+            )
 
     def update_reward(self, reward):
         # TODO: Move rewards to memory
-        self.last_reward = reward
-        self.reward = reward
         self.rewards_prev[self.reward_next_idx] = reward
         self.reward_next_idx = (self.reward_next_idx + 1) % self.num_previous_rewards
         self.reward_last_avg = self.reward_recent_avg
@@ -57,4 +68,5 @@ class History(dict):
         return self.reward_recent_max
 
     def reset(self):
-        self.__init__()
+        self.__init__(logger=self.logger, log_iters=self.log_iters, 
+                      num_previous_rewards=self.num_previous_rewards)

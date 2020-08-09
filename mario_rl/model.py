@@ -1,30 +1,42 @@
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import numpy as np
 
-def get_decision_network(input_size, nb_action, feature_encoder="conv", recurrent_encoder="lstm"):
+
+def get_decision_network(input_size, nb_action, 
+                         feature_encoder="conv", 
+                         recurrent_encoder="none",
+                         recurrent_units=32, 
+                         cuda=True):
     """ 
     Instantiates a decision network from a feature encoder and recurrent encoder
     """
     feature_encoders = {
-        "none": lambda x: x,
+        "none": lambda: nn.Identity(),
         "conv": lambda: get_conv_encoder(input_size),
         "resnet": lambda: None,
         "vgg": lambda: None
     }
 
-    encoder, recurrent_input_size = feature_encoders[feature_encoder]()
+    encoder, enc_output_size = feature_encoders[feature_encoder]()
 
     recurrent_encoders = {
-        "none": lambda: nn.Sequential(
-            encoder, nn.Linear(recurrent_input_size[-1], nb_action)),
-        "lstm": lambda: Network(recurrent_input_size, nb_action, 
-                                feature_encoder=encoder),
+        "none": lambda: (nn.Identity(), enc_output_size[-1]),
+        "lstm": lambda: (LSTMEncoder(enc_output_size[-1], recurrent_units), recurrent_units), 
         "bert": lambda: None
     }
-    return recurrent_encoders[recurrent_encoder]()
+
+    recurrent_encoder, out_channels = recurrent_encoders[recurrent_encoder]()
+    
+    decision_network = Network(input_size, out_channels, nb_action, 
+                               encoder, recurrent_encoder)
+    if cuda:
+        decision_network = decision_network.cuda()
+    return decision_network
 
 
 # Initializing and setting the variance of a tensor of weights
@@ -33,98 +45,90 @@ def normalized_columns_initializer(weights, std=1.0):
     out *= std / torch.sqrt(out.pow(2).sum(1, keepdim=True).expand_as(out)) # thanks to this initialization, we have var(out) = std^2
     return out
 
-# Initializing the weights of the neural network in an optimal way for the learning
-def weights_init(m):
-    classname = m.__class__.__name__ # python trick that will look for the type of connection in the object "m" (convolution or full connection)
-    if classname.find('Linear') != -1:
-        weight_shape = list(m.weight.data.size()) #?? list containing the shape of the weights in the object "m"
-        fan_in = weight_shape[1] # dim1
-        fan_out = weight_shape[0] # dim0
-        w_bound = np.sqrt(6. / (fan_in + fan_out)) # weight bound
-        m.weight.data.uniform_(-w_bound, w_bound) # generating some random weights of order inversely proportional to the size of the tensor of weights
-        m.bias.data.fill_(0) # initializing all the bias with zeros
 
-class Flatten(nn.Module):
+class SELayer(nn.Module):
+    def __init__(self, channels, reduction=16, activation="relu", **act_kwargs):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            get_activation(activation=activation, **act_kwargs),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Tanh()
+        )
+
     def forward(self, x):
-        return x.view(x.size(0), -1)
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x + x * y.expand_as(x)
 
-class Lambda(nn.Module):
-    "An easy way to create a pytorch layer for a simple `func`."
-    def __init__(self, func):
-        "create a layer that simply calls `func` with `x`"
-        super().__init__()
-        self.func=func
+class ConvAttention(nn.Module):
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.conv = nn.Conv2d(
+            in_channels=channels, 
+            out_channels=channels, 
+            kernel_size=3, padding=1)
+    
+    def forward(self, features):
+        attention = F.sigmoid(self.conv(features))
+        return features * attention
 
-    def forward(self, x): return self.func(x)
+def get_activation(activation, **act_kwargs):
+    if activation == "relu":
+        return nn.ReLU()
+    if activation == "lrelu":
+        return nn.LeakyReLU(**act_kwargs)
+    if activation == "pelu":
+        return nn.PReLU(**act_kwargs)
+    if activation == "sigmoid":
+        return nn.Sigmoid()
+    if activation == "tanh":
+        return nn.Tanh()
 
-def get_conv_encoder(input_size):
+
+def get_conv_encoder(input_size, activation="pelu", **act_kwargs):
     conv_encoder = torch.nn.Sequential(
         Preprocessor(),
-        torch.nn.Conv2d(1, 32, kernel_size=(3, 3)),
-        torch.nn.ReLU(),
+        torch.nn.Conv2d(1, 32, kernel_size=(5, 5)),
+        SELayer(32, activation=activation),
+        get_activation(activation, **act_kwargs),
         torch.nn.AvgPool2d(kernel_size=(2, 2)),
         torch.nn.Conv2d(32, 64, kernel_size=(3, 3)),
-        torch.nn.ReLU(),
+        get_activation(activation, **act_kwargs),
+        SELayer(64, activation=activation),
+        torch.nn.Conv2d(64, 64, kernel_size=(3, 3)),
+        get_activation(activation, **act_kwargs),
+        #torch.nn.Dropout(0.2),
+        torch.nn.AvgPool2d(kernel_size=(2, 2)),
+        torch.nn.Conv2d(64, 128, kernel_size=(3, 3)),
+        get_activation(activation, **act_kwargs),
+        torch.nn.Dropout(0.25),
+        ConvAttention(128),
         torch.nn.MaxPool2d(kernel_size=(2, 2)),
-        torch.nn.Dropout(0.1),
-        Flatten()
     ).cuda()
 
     test_input = torch.zeros(input_size[:2])[None, None]
-    return conv_encoder, conv_encoder(test_input.cuda()).shape
+    return conv_encoder, conv_encoder(test_input.cuda()).view(-1).shape
 
-class LSTMDecoder(nn.Module):
-    def __init__(self, in_channels, out_channels, num_levels=3, growth_rate=2, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        starting_side_length = torch.sqrt(torch.tensor(in_channels, dtype=torch.float))
-        assert starting_side_length.ceil() == starting_side_length
-        starting_side_length = starting_side_length.int()
-        self.starting_shape = (starting_side_length, starting_side_length)
-        self.in_channels = in_channels        
-        
-        self.relu = nn.ReLU(inplace=True)
 
-        levels = []
-        for level_num in range(num_levels):
-            if level_num == num_levels - 1:
-                current_out_channels = out_channels
-            else:
-                current_out_channels *= growth_rate^(num_levels - level_num)
-            current_in_channels = growth_rate^(num_levels - level_num)
-            levels.append(nn.Sequential(
-                nn.ConvTranspose2d(
-                    in_channels=1, 
-                    out_channels=current_out_channels, 
-                    kernel_size=4, 
-                    stride=1, 
-                    padding=0, 
-                    bias=False
-                    ),
-                    nn.BatchNorm2d(growth_rate*8),
-                    self.relu
-                    ))
-            
-        self.decoder = nn.Sequential(levels)
-
-        self.out = nn.Tanh()
+class LSTMEncoder(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(LSTMEncoder, self).__init__()
+        self.lstm = nn.LSTMCell(in_channels, out_channels)        
+        self.lstm.bias_ih.data.fill_(0) # initializing the lstm bias with zeros
+        self.lstm.bias_hh.data.fill_(0) # initializing the lstm bias with zeros
+        self.lstm_state = None
+        self.out_channels = out_channels
 
     def forward(self, x):
-        x = x.reshape(self.starting_shape)
-        decoded_state = self.decoder(x)
-        return self.out(decoded_state)
-    
-
-class LSTMConvAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.conv = nn.Conv(
-            in_channels=self.starting_shape, 
-            out_channels=out_channels, 
-            kernel_size=4)
-    
-    def forward(self, image, features):
-        attention = F.tanh(self.conv(features))
-        return image * F.interpolate(attention, image)
+        if self.lstm_state is not None and self.lstm_state[0].shape[0] != x.shape[0]:
+            self.lstm_state = None
+        # the LSTM takes as input x and the old hidden & cell states and ouputs the new hidden & cell states
+        self.last_state, self.cell_state = self.lstm(x, self.lstm_state)
+        self.lstm_state = (self.last_state, self.cell_state) 
+        return F.relu(self.last_state)
 
 
 
@@ -133,43 +137,31 @@ class Network(nn.Module): #inherinting from nn.Module
     
     #Self - refers to the object that will be created from this class
     #     - self here to specify that we're referring to the object
-    def __init__(self, input_size, nb_action, feature_encoder):
-        super(Network, self).__init__() #inorder to use modules in torch.nn
-        # Input and output neurons
+    def __init__(self, input_size, out_channels, nb_action, feature_encoder, recurrent_decoder):
+        super(Network, self).__init__() # inorder to use modules in torch.nn
 
         self.encoder = feature_encoder
 
-        self.lstm = nn.LSTMCell(input_size[-1], 32) # making an LSTM (Long Short Term Memory) to learn the temporal properties of the input
-        self.fcL = nn.Linear(32, nb_action) # full connection of the
-        self.apply(weights_init) # initilizing the weights of the model with random weights
-        self.fcL.weight.data = normalized_columns_initializer(self.fcL.weight.data, 0.01) # setting the standard deviation of the fcL tensor of weights to 0.01
-        self.fcL.bias.data.fill_(0) # initializing the actor bias with zeros
-        self.lstm.bias_ih.data.fill_(0) # initializing the lstm bias with zeros
-        self.lstm.bias_hh.data.fill_(0) # initializing the lstm bias with zeros
-        self.train() # setting the module in "train" mode to activate the dropouts and batchnorms
-        self.lstm_state = None
-        self.last_mask = None
+        self.recurrent_decoder = recurrent_decoder
 
-        #self.lstm_conv_decoder = LSTMDecoder(64, 16)
-        #self.attention = LSTMConvAttention(16, 3)
+        self.action_decoder = nn.Linear(out_channels, nb_action)
+        self.action_decoder.weight.data = normalized_columns_initializer(self.action_decoder.weight.data, 0.01) # setting the standard deviation of the action_decoder tensor of weights to 0.01
+        self.action_decoder.bias.data.fill_(0) # initializing the actor bias with zeros
 
-        #self.cuda()
+        self.train()
 
     # For function that will activate neurons and perform forward propagation
     def forward(self, state):
-        #if self.last_mask is not None:
-        #    state = state * self.last_mask
+        # encode input images into latent state
         encoded_state = self.encoder(state)
-        if self.lstm_state is not None and self.lstm_state[0].shape[0] != state.shape[0]:
-            self.lstm_state = None
-        # the LSTM takes as input x and the old hidden & cell states and ouputs the new hidden & cell states
-        self.last_state, self.cell_state = self.lstm(encoded_state, self.lstm_state)
-        self.lstm_state = (self.last_state, self.cell_state) 
-        
-        #decoded_last_state = self.lstm_conv_decoder()
-        #self.last_mask = self.attention(state, decoded_last_state)
+        encoded_state = torch.flatten(encoded_state, start_dim=1)
 
-        return self.fcL(F.relu(self.last_state)) # returning the output of the actor (Q(S,A)), and the new hidden & cell states
+        # apply recurrent stucture to encoded latent states
+        recurrent_encoded_state = self.recurrent_decoder(encoded_state)
+
+        # map recurrent state onto action space
+        action_probs = self.action_decoder(recurrent_encoded_state)
+        return action_probs
 
 def rgb2gray(rgb):
     h = rgb.cuda() * torch.tensor([0.2989, 0.5870, 0.1140])[None, :, None, None].cuda()

@@ -3,21 +3,22 @@ import multiprocessing
 import numpy as np
 
 import torch
-from mario_rl.dqn import DQN, compute_cost
+from mario_rl.dqn import DQN
 from mario_rl.utils.logging import Logger
 import os
 
+import gym
 
 RELOAD_PREVIOUS_MODEL = False    # Reloads model from previous training session
 PROFILE_CODE = False             # Profile code line by line
-MAX_STEPS = 30000                # Maximum number of iterations
+MAX_STEPS = 50000                # Maximum number of iterations
 LOG_ITERS = 100                  # Interval with which to log metrics
-MAX_ITERS_NO_IMPROVEMENT = 200   # Maximum number of iterations before reseting game if no improvement
-FRAMES_PER_SECOND = 30           # Number of frames per second to display
-MAX_FRAMES_PER_SECOND = 30
-USE_WANDB = False
-USE_MULTIPROCESSING = False
-OUTPUT_DIR = None  # 'F:\\wandb_mario_experiments'
+MAX_ITERS_NO_IMPROVEMENT = 100   # Maximum number of iterations before reseting game if no improvement
+FRAMES_PER_SECOND =  100         # Number of frames per second to display
+USE_WANDB = True                 # If True, logs will be recorded using Weights & Biases
+USE_MULTIPROCESSING = False      # If True, N parallel games will be trained
+NUM_PARALLEL_GAMES = 4           # Number of games played in parallel when using multiprocessing
+OUTPUT_DIR = './output/wandb_mario_experiments'  # output directory to save logs
 
 def play_mario(*args, **kwargs):
     from mario_rl.history import History
@@ -27,94 +28,81 @@ def play_mario(*args, **kwargs):
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, SIMPLE_MOVEMENT)
 
-    RAW_IMAGE_SIZE = env.observation_space.shape
-    # Create DQAN model
-    history = History()
-    model = DQN(input_size=RAW_IMAGE_SIZE, 
+    # Create DQN model
+    model = DQN(input_size=env.observation_space.shape, 
                 nb_action=env.action_space.n, 
-                gamma=0.98, 
-                lrate=0.01, 
-                history=history, 
-                reload_previous_model=RELOAD_PREVIOUS_MODEL)
+                gamma=0.9, 
+                lrate=0.001,
+                temperature=0.95,
+                reload_previous_model=RELOAD_PREVIOUS_MODEL,
+                store_feature_maps=True)
 
-    logger = Logger(log_dir=OUTPUT_DIR, use_wandb=USE_WANDB)
+    logger = Logger(env=env, model=model, 
+                    log_dir=OUTPUT_DIR, use_wandb=USE_WANDB)
+    history = History(logger=logger, log_iters=LOG_ITERS)
 
-    done = True
-    reward = None
+    def step(model, state, current_step, total_current_reward):
+        # get the next action from the model
+        action = model.select_action(state).item()
+
+        # TODO: get sparse attention maps from model for visualization
+        
+        # take a step in the game
+        next_state, reward, done, info = env.step(action)
+
+        total_current_reward += reward
+
+        # update the model
+        loss = model.update(state, action, reward, next_state, done)
+
+        # Add all important information about current iteration to history
+        history.update(
+            step_num=current_step,
+            force_log=done,
+            action=action,
+            state=state,
+            action_rate=model.action_rate,
+            reward=reward,
+            total_current_reward=total_current_reward+reward,
+            done=done,
+            loss=loss,
+            **{k: v.flatten() for k, v in model.feature_maps.items()},
+        )
+
+        return model, next_state, reward, total_current_reward, done
+        
     start_time = time.time()
-    for current_step in range(1, MAX_STEPS):
-        start_of_step_time = time.time()
+    time_since_last_frame = time.time()
+    state = env.reset()
+    no_improvement_cntr = 0
+    total_current_reward = 0
+    for current_step in range(MAX_STEPS):
+
+        model, state, reward, total_current_reward, done \
+            = step(model, state, current_step, total_current_reward)
+
+        # check if any improvement has been made
+        no_improvement_cntr = 0 if reward > 0 else no_improvement_cntr + 1
+        if no_improvement_cntr > MAX_ITERS_NO_IMPROVEMENT:
+            no_improvement_cntr = 0
+            done = True
+
+        current_fps = 1/(time.time() - time_since_last_frame)
+        if current_fps < FRAMES_PER_SECOND:
+            env.render()
+            time_since_last_frame = time.time()
+
         if done:
-            history["x_pos"] = None
-            history["prev_x_pos"] = None
-            history["y_pos"] = None
-            history["prev_y_pos"] = None
-            history["overall_reward"] = 0.0
             print(f"Best improvement so far: {history.overall_best}")
             print(f"Average improvement so far: {history.recent_best}")
             print(f"Last improvement: {reward}")
             print(f"Current step: {current_step}/{MAX_STEPS}")
             state = env.reset()
             history.reset()
-
-        action = model.select_action(state)
-        action = action.cpu().numpy().item()
-
-        # TODO: Get sparse attention maps from model for visualization
-        
-        # take a step in the game
-        next_state, raw_reward, done, info = env.step(action)
-
-        # determine how good the move was
-        # TODO: Incorporate learned cost function via actor/critic model
-        # TODO: Create subgoals to try to maximize global goals.
-        #       If those subgoals ddon't improve upon global goals, 
-        #       throw away and create new subgoals
-        #       Add relavent subgoals to memory
-        current_reward, overall_reward, movement = compute_cost(
-            env_reward=raw_reward, overall_reward=history["overall_reward"],
-            x_pos=info["x_pos"], prev_x_pos=history["prev_x_pos"],
-            y_pos=info["y_pos"], prev_y_pos=history["prev_y_pos"],
-            done=done)
-
-        # Add all important information about current iteration to history
-        history.update(
-            current_step=current_step,
-            prev_reward=overall_reward,
-            current_reward=current_reward,
-            reward=overall_reward,
-            overall_reward=overall_reward,
-            raw_reward=raw_reward,
-            action=action,
-            movement=movement,
-            action_rate=model.action_rate, 
-            done=done,
-            prev_x_pos=info["x_pos"],
-            prev_y_pos=info["y_pos"],
-        )
-
-        # model ocasionally trains for a few generations
-        model.update(state, action, overall_reward, next_state, done)
-
-        # log infomation every LOG_ITERS actions made
-        if done or model.action_count % LOG_ITERS:
-            logger.log_metrics(next_state, info, history)
-
-        state = next_state
-
-        # TODO: Add early stopping if no improvement is seen for K iterations
-
-        end_of_step_time = time.time()
-        step_time_taken = (end_of_step_time - start_of_step_time)
-        current_fps = 1/step_time_taken
-        if current_fps > FRAMES_PER_SECOND:
-            env.render()
-        
-        time.sleep(max(0, step_time_taken - 1/MAX_FRAMES_PER_SECOND))
+            total_current_reward = 0
 
     end_time = time.time()
     logger.log({"total_time(seconds)": end_time - start_time})
-    time.sleep(torch.empty(1).random_(to=10).item())
 
     # TODO: Average the weights of multiple runs together
     model.save()
@@ -132,8 +120,8 @@ def main(profile=False, use_multiprocessing=False):
         #play_mario = profiler(play_mario)
 
     if use_multiprocessing:
-        with multiprocessing.Pool(4) as pool:
-            pool.map(play_mario, [None]*4)
+        with multiprocessing.Pool(NUM_PARALLEL_GAMES) as pool:
+            pool.map(play_mario, [None]*NUM_PARALLEL_GAMES)
     else:
         play_mario()
 
